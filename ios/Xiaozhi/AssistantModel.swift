@@ -60,6 +60,8 @@ final class AssistantModel: ObservableObject {
     @Published var status = "点击开始说话，结束后点击发送语音。"
     @Published var isListening = false
     @Published var isBusy = false
+    @Published var isSpeaking = false
+    private var shouldResumeListening = false
 
     private var localSpeech: LocalSpeechEngine?
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN"))
@@ -97,15 +99,17 @@ final class AssistantModel: ObservableObject {
                 try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth])
                 try AVAudioSession.sharedInstance().setActive(true)
                 let local = LocalSpeechEngine()
-                try local.start { [weak self] text in
+                try await local.start { [weak self] text in
                     Task { @MainActor [weak self] in
                         guard let self, self.generation == token else { return }
                         self.localSpeech?.stop(); self.localSpeech = nil
+                        self.shouldResumeListening = true
                         self.isListening = false
                         self.transcript = text
                         self.send()
                     }
                 }
+                guard generation == token else { local.stop(); return }
                 localSpeech = local
                 isBusy = false; isListening = true; status = "正在监听：小智同学"
             } catch {
@@ -240,7 +244,13 @@ final class AssistantModel: ObservableObject {
                 isBusy = false; status = "回答完成。"
                 let utterance = AVSpeechUtterance(string: Self.speechText(answer))
                 utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
+                isSpeaking = true
                 synthesizer.speak(utterance)
+                while synthesizer.isSpeaking && generation == token {
+                    try await Task.sleep(nanoseconds: 150_000_000)
+                }
+                isSpeaking = false
+                if generation == token && shouldResumeListening { shouldResumeListening = false; startAutoListening() }
             } catch {
                 guard generation == token else { return }
                 isBusy = false
@@ -248,12 +258,14 @@ final class AssistantModel: ObservableObject {
                 if messages.last?.id == userMessage.id { messages.removeLast() }
                 transcript = text
                 status = "请求失败：\(error.localizedDescription)"
+                if shouldResumeListening { shouldResumeListening = false; startAutoListening() }
             }
         }
     }
 
     func stopAll() {
         generation = UUID()
+        shouldResumeListening = false; isSpeaking = false
         localSpeech?.stop(); localSpeech = nil
         networkTask?.cancel(); networkTask = nil
         if isBusy, let last = messages.last, last.role == "user" {

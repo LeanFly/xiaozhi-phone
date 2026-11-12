@@ -13,9 +13,11 @@ public final class LocalSpeechEngine {
     private let audioEngine = AVAudioEngine()
     private var converter: AVAudioConverter?
     private var inputFormat: AVAudioFormat?
-    private var kws: UnsafePointer<SherpaOnnxKeywordSpotter>?
-    private var kwsStream: UnsafePointer<SherpaOnnxOnlineStream>?
-    private var asr: UnsafePointer<SherpaOnnxOfflineRecognizer>?
+    // The C module exposes these opaque handles as OpaquePointer.
+    private var kws: OpaquePointer?
+    private var kwsStream: OpaquePointer?
+    private var asr: OpaquePointer?
+    private let queueKey = DispatchSpecificKey<Void>()
     private var running = false
     private var stopping = false
     private var collecting = false
@@ -34,39 +36,57 @@ public final class LocalSpeechEngine {
     public init(keyword: String? = nil, maxUtteranceSeconds: Double = 8.0) {
         self.keyword = keyword
         self.maxUtteranceSeconds = max(1.0, maxUtteranceSeconds)
+        workQueue.setSpecific(key: queueKey, value: ())
     }
 
-    /// Starts microphone capture. `completion` is invoked once per detected utterance.
-    public func start(completion: @escaping Completion) throws {
-        try workQueue.sync {
-            guard !running else { return }
-            self.completion = completion
-            try configureModels()
-            let input = audioEngine.inputNode
-            guard let format = input.inputFormat(forBus: 0).copy() as? AVAudioFormat,
-                  format.sampleRate > 0 else {
-                throw EngineError.microphoneUnavailable
+    /// Starts microphone capture without doing model/audio setup on the caller's queue.
+    public func start(completion: @escaping Completion) async throws {
+        try Task.checkCancellation()
+        try await withCheckedThrowingContinuation { continuation in
+            workQueue.async { [self] in
+                do {
+                    try Task.checkCancellation()
+                    guard !self.running else { continuation.resume(); return }
+                    self.completion = completion
+                    do {
+                        try self.configureModels()
+                        let input = self.audioEngine.inputNode
+                        // outputFormat is the format actually produced by the input node.
+                        let format = input.outputFormat(forBus: 0)
+                        guard format.sampleRate > 0, format.channelCount > 0 else {
+                            throw EngineError.microphoneUnavailable
+                        }
+                        self.inputFormat = format
+                        let target = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                                   sampleRate: Double(Self.sampleRate), channels: 1,
+                                                   interleaved: false)!
+                        self.converter = AVAudioConverter(from: format, to: target)
+                        guard self.converter != nil else { throw EngineError.converterUnavailable }
+                        input.installTap(onBus: 0, bufferSize: Self.tapBufferFrames, format: format) { [weak self] buffer, _ in
+                            // The tap's buffer storage may be reused after this callback; make an owned copy.
+                            guard let copy = buffer.mutableCopy() as? AVAudioPCMBuffer else { return }
+                            self?.convertAndEnqueue(copy)
+                        }
+                        self.audioEngine.prepare()
+                        try self.audioEngine.start()
+                        self.running = true
+                        self.stopping = false
+                        continuation.resume()
+                    } catch {
+                        self.stopLocked()
+                        continuation.resume(throwing: error)
+                    }
+                } catch { continuation.resume(throwing: error) }
             }
-            inputFormat = format
-            converter = AVAudioConverter(from: format,
-                                         to: AVAudioFormat(commonFormat: .pcmFormatFloat32,
-                                                           sampleRate: Double(Self.sampleRate),
-                                                           channels: 1,
-                                                           interleaved: false)!)
-            guard converter != nil else { throw EngineError.converterUnavailable }
-            input.installTap(onBus: 0, bufferSize: Self.tapBufferFrames, format: format) { [weak self] buffer, _ in
-                self?.convertAndEnqueue(buffer)
-            }
-            audioEngine.prepare()
-            try audioEngine.start()
-            running = true
         }
     }
 
     /// Stops capture and releases all native sherpa-onnx handles.
     public func stop() {
-        workQueue.sync {
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
             stopLocked()
+        } else {
+            workQueue.sync { stopLocked() }
         }
     }
 
@@ -115,7 +135,7 @@ public final class LocalSpeechEngine {
         }
         if !collecting {
             guard let result = SherpaOnnxGetKeywordResult(kws, stream) else { return }
-            let hit = result.pointee.keyword.map(String.init(cString:)) ?? ""
+            let hit = result.pointee.keyword.map { String(cString: $0) } ?? ""
             SherpaOnnxDestroyKeywordResult(result)
             guard !hit.isEmpty else { return }
             collecting = true
@@ -147,7 +167,7 @@ public final class LocalSpeechEngine {
         SherpaOnnxDecodeOfflineStream(asr, stream)
         var text = ""
         if let result = SherpaOnnxGetOfflineStreamResult(stream) {
-            text = result.pointee.text.map(String.init(cString:))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            text = result.pointee.text.map { String(cString: $0) }?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines) ?? ""
             SherpaOnnxDestroyOfflineRecognizerResult(result)
         }
         SherpaOnnxDestroyOfflineStream(stream)
@@ -174,17 +194,17 @@ public final class LocalSpeechEngine {
         kc.max_active_paths = 4; kc.num_trailing_blanks = 1; kc.keywords_score = 3; kc.keywords_threshold = 0.1
         var ac = SherpaOnnxOfflineRecognizerConfig()
         ac.feat_config.sample_rate = Int32(Self.sampleRate); ac.feat_config.feature_dim = Int32(Self.featureDim)
-        ac.decoding_method = strdup("greedy_search")
+        ac.decoding_method = strdup("greedy_search").map { UnsafePointer<CChar>($0) }
         ef.path.withCString { e in df.path.withCString { d in jf.path.withCString { j in kt.path.withCString { t in kw.path.withCString { w in
             kc.model_config.transducer.encoder = e; kc.model_config.transducer.decoder = d; kc.model_config.transducer.joiner = j
-            kc.model_config.tokens = t; kc.keywords_file = w; kc.model_config.provider = strdup("cpu"); kc.model_config.num_threads = 2
+            kc.model_config.tokens = t; kc.keywords_file = w; kc.model_config.provider = strdup("cpu").map { UnsafePointer<CChar>($0) }; kc.model_config.num_threads = 2
             kws = SherpaOnnxCreateKeywordSpotter(&kc)
         }}}}}
         guard let kws else { throw EngineError.modelLoadFailed("kws") }
         kwsStream = keyword?.withCString { SherpaOnnxCreateKeywordStreamWithKeywords(kws, $0) } ?? SherpaOnnxCreateKeywordStream(kws)
         st.path.withCString { t in sm.path.withCString { m in
-            ac.model_config.tokens = t; ac.model_config.provider = strdup("cpu"); ac.model_config.num_threads = 2
-            ac.model_config.sense_voice.model = m; ac.model_config.sense_voice.language = strdup("auto"); ac.model_config.sense_voice.use_itn = 1
+            ac.model_config.tokens = t; ac.model_config.provider = strdup("cpu").map { UnsafePointer<CChar>($0) }; ac.model_config.num_threads = 2
+            ac.model_config.sense_voice.model = m; ac.model_config.sense_voice.language = strdup("auto").map { UnsafePointer<CChar>($0) }; ac.model_config.sense_voice.use_itn = 1
             asr = SherpaOnnxCreateOfflineRecognizer(&ac)
         }}
         guard asr != nil, kwsStream != nil else { throw EngineError.modelLoadFailed("sense") }

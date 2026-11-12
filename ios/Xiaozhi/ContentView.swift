@@ -8,7 +8,7 @@ struct ContentView: View {
     @State private var holding = false
     @FocusState private var editing: Bool
 
-    private var waiting: Bool { assistant.isBusy && assistant.status.hasPrefix("正在请求回答") }
+    private var waiting: Bool { assistant.isBusy && (assistant.status.hasPrefix("正在请求回答") || assistant.status.hasPrefix("正在通过 HTTP")) }
     private var statusColor: Color {
         if assistant.isListening { return Color(red: 0.47, green: 0.94, blue: 0.78) }
         if assistant.isBusy { return Color(red: 1, green: 0.83, blue: 0.54) }
@@ -25,7 +25,7 @@ struct ContentView: View {
                     let time = timeline.date.timeIntervalSinceReferenceDate
                     ZStack {
                         if waiting { Ripple(time: time).allowsHitTesting(false) }
-                        Mascot(time: time, listening: assistant.isListening, speaking: timeline.date < speakingUntil && !assistant.isListening && !assistant.isBusy)
+                        Mascot(time: time, listening: assistant.isListening, speaking: assistant.isSpeaking)
                             .frame(width: min(geometry.size.width - 48, geometry.size.height * 0.65), height: min(geometry.size.width - 48, geometry.size.height * 0.65))
                             .contentShape(Rectangle())
                             .onLongPressGesture(minimumDuration: 5, maximumDistance: 20, pressing: { holding = $0 }, perform: {
