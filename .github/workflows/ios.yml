@@ -45,6 +45,9 @@ jobs:
           set -euo pipefail
           app="$RUNNER_TEMP/xiaozhi-derived/Build/Products/Release-iphoneos/Xiaozhi.app"
           test -d "$app"
+          test -s "$app/sense/model.int8.onnx"
+          test -s "$app/sense/tokens.txt"
+          test -s "$app/kws/keywords.txt"
           mkdir -p "$RUNNER_TEMP/unsigned-ipa/Payload"
           ditto "$app" "$RUNNER_TEMP/unsigned-ipa/Payload/Xiaozhi.app"
           cd "$RUNNER_TEMP/unsigned-ipa"

@@ -21,6 +21,12 @@ targets:
       - path: Xiaozhi
         excludes:
           - Info.plist
+      - path: Models/kws
+        type: folder
+        buildPhase: resources
+      - path: Models/sense
+        type: folder
+        buildPhase: resources
     info:
       path: Xiaozhi/Info.plist
       properties:
@@ -28,11 +34,6 @@ targets:
         NSLocalNetworkUsageDescription: "连接局域网内用户配置的模型服务。"
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
-    resources:
-      - path: Models/kws
-        type: folder
-      - path: Models/sense
-        type: folder
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.xiaozhi.ios
