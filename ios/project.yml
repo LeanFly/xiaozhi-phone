@@ -1,0 +1,32 @@
+name: Xiaozhi
+options:
+  deploymentTarget:
+    iOS: "17.0"
+  generateEmptyDirectories: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+targets:
+  Xiaozhi:
+    type: application
+    platform: iOS
+    sources:
+      - path: Xiaozhi
+        excludes:
+          - Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.xiaozhi.ios
+        PRODUCT_NAME: Xiaozhi
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Xiaozhi
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: "使用麦克风进行语音对话。"
+        INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: "使用语音识别将语音转换为文本。"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ARCHS: arm64
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+    scheme:
+      build:
+        targets:
+          Xiaozhi: all
