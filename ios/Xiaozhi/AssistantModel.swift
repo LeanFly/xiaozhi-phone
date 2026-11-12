@@ -99,6 +99,7 @@ final class AssistantModel: ObservableObject {
                 try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth])
                 try AVAudioSession.sharedInstance().setActive(true)
                 let local = LocalSpeechEngine()
+                localSpeech = local
                 try await local.start { [weak self] text in
                     Task { @MainActor [weak self] in
                         guard let self, self.generation == token else { return }

@@ -18,8 +18,11 @@ public final class LocalSpeechEngine {
     private var kwsStream: OpaquePointer?
     private var asr: OpaquePointer?
     private let queueKey = DispatchSpecificKey<Void>()
+    private let stateLock = NSLock()
+    private var stopRequested = false
     private var running = false
     private var stopping = false
+    private var tapInstalled = false
     private var collecting = false
     private var utterance: [Float] = []
     private var utteranceSamples = 0
@@ -46,6 +49,8 @@ public final class LocalSpeechEngine {
             workQueue.async { [self] in
                 do {
                     try Task.checkCancellation()
+                    self.stateLock.lock(); let wasStopped = self.stopRequested; self.stopRequested = false; self.stateLock.unlock()
+                    guard !wasStopped else { throw CancellationError() }
                     guard !self.running else { continuation.resume(); return }
                     self.completion = completion
                     do {
@@ -67,6 +72,9 @@ public final class LocalSpeechEngine {
                             guard let copy = buffer.mutableCopy() as? AVAudioPCMBuffer else { return }
                             self?.convertAndEnqueue(copy)
                         }
+                        self.tapInstalled = true
+                        self.stateLock.lock(); let cancelled = self.stopRequested; self.stateLock.unlock()
+                        guard !cancelled else { throw CancellationError() }
                         self.audioEngine.prepare()
                         try self.audioEngine.start()
                         self.running = true
@@ -83,6 +91,7 @@ public final class LocalSpeechEngine {
 
     /// Stops capture and releases all native sherpa-onnx handles.
     public func stop() {
+        stateLock.lock(); stopRequested = true; stateLock.unlock()
         if DispatchQueue.getSpecific(key: queueKey) != nil {
             stopLocked()
         } else {
@@ -96,7 +105,7 @@ public final class LocalSpeechEngine {
         guard !stopping else { return }
         stopping = true
         if audioEngine.isRunning { audioEngine.stop() }
-        audioEngine.inputNode.removeTap(onBus: 0)
+        if tapInstalled { audioEngine.inputNode.removeTap(onBus: 0); tapInstalled = false }
         if let s = kwsStream { SherpaOnnxDestroyOnlineStream(s) }
         if let k = kws { SherpaOnnxDestroyKeywordSpotter(k) }
         if let a = asr { SherpaOnnxDestroyOfflineRecognizer(a) }
