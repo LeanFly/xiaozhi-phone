@@ -21,6 +21,15 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install XcodeGen
         run: brew install xcodegen
+      - name: Download and verify local speech model
+        run: |
+          set -euo pipefail
+          mkdir -p ios/Models/sense ios/Models/kws
+          base=https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main
+          curl -fL --retry 3 "$base/model.int8.onnx" -o ios/Models/sense/model.int8.onnx
+          echo 'c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51  ios/Models/sense/model.int8.onnx' | shasum -a 256 -c -
+          curl -fL --retry 3 "$base/tokens.txt" -o ios/Models/sense/tokens.txt
+          cp app/src/main/assets/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01/* ios/Models/kws/
       - name: Generate Xcode project
         working-directory: ios
         run: xcodegen generate

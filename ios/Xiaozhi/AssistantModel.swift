@@ -61,6 +61,7 @@ final class AssistantModel: ObservableObject {
     @Published var isListening = false
     @Published var isBusy = false
 
+    private var localSpeech: LocalSpeechEngine?
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN"))
     private let engine = AVAudioEngine()
     private let synthesizer = AVSpeechSynthesizer()
@@ -75,8 +76,43 @@ final class AssistantModel: ObservableObject {
             try KeyStore.save(apiKey)
             UserDefaults.standard.set(baseURL.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "baseURL")
             UserDefaults.standard.set(model.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "model")
-            status = "设置已保存。"
+            if let url = endpoint(), url.scheme?.lowercased() == "http" {
+                status = "设置已保存。警告：HTTP 明文传输，聊天内容和 API 密钥可能被局域网中的其他人窃取。"
+            } else {
+                status = "设置已保存。"
+            }
         } catch { status = error.localizedDescription }
+    }
+
+    func startAutoListening() {
+        guard !isListening && !isBusy else { return }
+        let token = UUID(); generation = token
+        isBusy = true
+        status = "正在请求麦克风权限…"
+        Task {
+            let allowed = await AVAudioApplication.requestRecordPermission()
+            guard generation == token else { return }
+            guard allowed else { isBusy = false; status = "需要麦克风权限"; return }
+            do {
+                try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth])
+                try AVAudioSession.sharedInstance().setActive(true)
+                let local = LocalSpeechEngine()
+                try local.start { [weak self] text in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.generation == token else { return }
+                        self.localSpeech?.stop(); self.localSpeech = nil
+                        self.isListening = false
+                        self.transcript = text
+                        self.send()
+                    }
+                }
+                localSpeech = local
+                isBusy = false; isListening = true; status = "正在监听：小智同学"
+            } catch {
+                isBusy = false; isListening = false
+                status = "本地语音启动失败：\(error.localizedDescription)"
+            }
+        }
     }
 
     func startListening() {
@@ -168,14 +204,15 @@ final class AssistantModel: ObservableObject {
         let text = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { status = "请输入或识别问题。"; return }
         guard let url = endpoint(), !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            status = "请在设置中填写有效的 HTTPS 接口地址和模型。"; return
+            status = "请填写有效的 HTTPS 地址或局域网 HTTP 地址及模型；HTTP 明文传输有泄露风险。"; return
         }
         let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !key.isEmpty else { status = "请先在设置中填写 API 密钥。"; return }
         let userMessage = ChatMessage(role: "user", content: text)
         let outgoing = messages + [userMessage]
         messages.append(userMessage); transcript = ""; isBusy = true
-        status = "正在请求回答…"
+        status = url.scheme?.lowercased() == "http"
+            ? "正在通过 HTTP 明文请求；聊天内容和 API 密钥可能被窃取。"
+            : "正在请求回答…"
         let token = UUID(); generation = token
         let selectedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
         networkTask = Task {
@@ -184,9 +221,12 @@ final class AssistantModel: ObservableObject {
                 req.httpMethod = "POST"
                 req.timeoutInterval = 60
                 req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+                if !key.isEmpty { req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
                 req.httpBody = try JSONEncoder().encode(ChatRequest(model: selectedModel, messages: outgoing))
-                let (data, response) = try await URLSession.shared.data(for: req)
+                // Never follow redirects: an otherwise permitted LAN URL could redirect to public HTTP.
+                let session = URLSession(configuration: .default, delegate: NoRedirectDelegate(), delegateQueue: nil)
+                defer { session.invalidateAndCancel() }
+                let (data, response) = try await session.data(for: req)
                 try Task.checkCancellation()
                 guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
                     throw AssistantError.message("接口返回 HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)。")
@@ -198,7 +238,7 @@ final class AssistantModel: ObservableObject {
                 guard generation == token else { return }
                 messages.append(ChatMessage(role: "assistant", content: answer))
                 isBusy = false; status = "回答完成。"
-                let utterance = AVSpeechUtterance(string: answer)
+                let utterance = AVSpeechUtterance(string: Self.speechText(answer))
                 utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
                 synthesizer.speak(utterance)
             } catch {
@@ -214,6 +254,7 @@ final class AssistantModel: ObservableObject {
 
     func stopAll() {
         generation = UUID()
+        localSpeech?.stop(); localSpeech = nil
         networkTask?.cancel(); networkTask = nil
         if isBusy, let last = messages.last, last.role == "user" {
             transcript = last.content
@@ -227,14 +268,56 @@ final class AssistantModel: ObservableObject {
 
     private func endpoint() -> URL? {
         let value = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard var components = URLComponents(string: value), components.scheme?.lowercased() == "https",
-              components.host != nil, components.user == nil, components.password == nil,
-              components.query == nil, components.fragment == nil else { return nil }
+        guard var components = URLComponents(string: value),
+              let scheme = components.scheme?.lowercased(), let host = components.host, !host.isEmpty,
+              components.user == nil, components.password == nil,
+              components.query == nil, components.fragment == nil,
+              scheme == "https" || (scheme == "http" && Self.isPrivateIPv4(host)) else { return nil }
         var path = components.path
         while path.hasSuffix("/") { path.removeLast() }
-        if !path.hasSuffix("/chat/completions") { path += "/chat/completions" }
+        if !path.hasSuffix("/v1/chat/completions") {
+            if path.hasSuffix("/v1") { path += "/chat/completions" }
+            else { path += "/v1/chat/completions" }
+        }
         components.path = path
         return components.url
+    }
+
+    // Numeric RFC 1918 addresses only: hostnames could resolve or rebind to public addresses.
+    private static func isPrivateIPv4(_ host: String) -> Bool {
+        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return false }
+        let numbers = parts.compactMap { part -> Int? in
+            guard !part.isEmpty, part.allSatisfy({ $0 >= "0" && $0 <= "9" }),
+                  part.count == 1 || part.first != "0", let number = Int(part), number <= 255 else { return nil }
+            return number
+        }
+        guard numbers.count == 4 else { return false }
+        return numbers[0] == 10 || (numbers[0] == 172 && (16...31).contains(numbers[1])) ||
+            (numbers[0] == 192 && numbers[1] == 168)
+    }
+
+    private static func speechText(_ markdown: String) -> String {
+        var text = markdown
+        let replacements: [(String, String)] = [
+            ("```[^\\n]*\\n([\\s\\S]*?)```", "$1"),
+            ("!\\[([^\\]]*)\\]\\([^)]*\\)", "$1"),
+            ("\\[([^\\]]+)\\]\\([^)]*\\)", "$1"),
+            ("(?m)^\\s{0,3}(?:#{1,6}\\s+|>\\s*|[-+*]\\s+|\\d+[.)]\\s+)", ""),
+            ("[`*_~]", "")
+        ]
+        for (pattern, replacement) in replacements {
+            text = text.replacingOccurrences(of: pattern, with: replacement, options: .regularExpression)
+        }
+        return text
+    }
+
+    private final class NoRedirectDelegate: NSObject, URLSessionTaskDelegate {
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
+                        completionHandler: @escaping (URLRequest?) -> Void) {
+            completionHandler(nil)
+        }
     }
 
     private struct ChatRequest: Encodable { let model: String; let messages: [ChatMessage] }
