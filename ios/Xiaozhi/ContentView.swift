@@ -4,6 +4,7 @@ struct ContentView: View {
     @StateObject private var assistant = AssistantModel()
     @Environment(\.scenePhase) private var scenePhase
     @State private var showingSettings = false
+    @State private var displayPolicy = DisplayPolicy()
     @State private var speakingUntil = Date.distantPast
     @State private var holding = false
     @FocusState private var editing: Bool
@@ -74,7 +75,8 @@ struct ContentView: View {
         }
         .preferredColorScheme(.dark)
         .statusBarHidden(true)
-        .onAppear { assistant.startAutoListening() }
+        .onAppear { displayPolicy.activate(); assistant.startAutoListening() }
+        .onDisappear { displayPolicy.deactivate() }
         .sheet(isPresented: $showingSettings) { SettingsView(assistant: assistant) }
         .onChange(of: assistant.messages.count) { _, _ in
             if let message = assistant.messages.last, message.role == "assistant" {
@@ -83,8 +85,8 @@ struct ContentView: View {
             }
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active { speakingUntil = .distantPast; assistant.stopAll() }
-            else if !showingSettings { assistant.startAutoListening() }
+            if phase != .active { displayPolicy.deactivate(); speakingUntil = .distantPast; assistant.stopAll() }
+            else { displayPolicy.activate(); if !showingSettings { assistant.startAutoListening() } }
         }
     }
 }
