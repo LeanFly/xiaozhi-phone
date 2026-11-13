@@ -42,7 +42,8 @@ targets:
         INFOPLIST_KEY_CFBundleDisplayName: Xiaozhi
         INFOPLIST_KEY_NSMicrophoneUsageDescription: "使用麦克风进行语音对话。"
         INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: "使用语音识别将语音转换为文本。"
-        TARGETED_DEVICE_FAMILY: "1,2"
+        TARGETED_DEVICE_FAMILY: "1"
+        UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait"
         ARCHS: arm64
         CODE_SIGNING_ALLOWED: NO
         CODE_SIGNING_REQUIRED: NO

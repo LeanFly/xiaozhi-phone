@@ -66,19 +66,10 @@ struct ContentView: View {
                             }
                         }
                     }
-                    HStack(alignment: .bottom, spacing: 8) {
-                        TextField("识别结果或输入问题", text: $assistant.transcript, axis: .vertical)
-                            .lineLimit(1...3).focused($editing).padding(10)
-                            .background(.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
-                            .disabled(assistant.isListening || assistant.isBusy)
-                        Button { editing = false; speakingUntil = .distantPast; if assistant.isListening { assistant.stopListening() } else { assistant.startListening() } } label: {
-                            Image(systemName: assistant.isListening ? "stop.circle.fill" : "mic.circle.fill").font(.system(size: 32))
-                        }.disabled(assistant.isBusy).accessibilityLabel(assistant.isListening ? "停止识别" : "开始说话")
-                        Button("发送") { editing = false; assistant.send() }
-                            .disabled(assistant.isListening || assistant.isBusy)
-                        Button("停止") { speakingUntil = .distantPast; assistant.stopAll() }
-                    }.foregroundStyle(.white).tint(.cyan)
-                }.padding(.horizontal, 20).padding(.top, 12).padding(.bottom, 12)
+                    if !assistant.messages.isEmpty {
+                        Color.clear.frame(height: 1)
+                    }
+                }.padding(.horizontal, 20).padding(.top, 12).padding(.bottom, 28)
             }
         }
         .preferredColorScheme(.dark)
