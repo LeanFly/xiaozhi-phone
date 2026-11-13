@@ -74,6 +74,8 @@ final class AssistantModel: ObservableObject {
     private var tapInstalled = false
 
     func saveSettings() {
+        let wasAutoListening = isListening || shouldResumeListening
+        stopAll()
         do {
             try KeyStore.save(apiKey)
             UserDefaults.standard.set(baseURL.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "baseURL")
@@ -84,6 +86,7 @@ final class AssistantModel: ObservableObject {
                 status = "设置已保存。"
             }
         } catch { status = error.localizedDescription }
+        if wasAutoListening { startAutoListening() }
     }
 
     func startAutoListening() {
@@ -112,7 +115,7 @@ final class AssistantModel: ObservableObject {
                 }
                 guard generation == token else { local.stop(); return }
                 localSpeech = local
-                isBusy = false; isListening = true; status = "正在监听：小智同学"
+                isBusy = false; isListening = true; status = "正在监听：小智同学"; shouldResumeListening = true
             } catch {
                 isBusy = false; isListening = false
                 status = "本地语音启动失败：\(error.localizedDescription)"
@@ -251,7 +254,7 @@ final class AssistantModel: ObservableObject {
                     try await Task.sleep(nanoseconds: 150_000_000)
                 }
                 isSpeaking = false
-                if generation == token && shouldResumeListening { shouldResumeListening = false; startAutoListening() }
+                if generation == token && shouldResumeListening { startAutoListening() }
             } catch {
                 guard generation == token else { return }
                 isBusy = false
@@ -259,14 +262,15 @@ final class AssistantModel: ObservableObject {
                 if messages.last?.id == userMessage.id { messages.removeLast() }
                 transcript = text
                 status = "请求失败：\(error.localizedDescription)"
-                if shouldResumeListening { shouldResumeListening = false; startAutoListening() }
+                if shouldResumeListening { startAutoListening() }
             }
         }
     }
 
     func stopAll() {
         generation = UUID()
-        shouldResumeListening = false; isSpeaking = false
+        if !isListening && !isBusy { shouldResumeListening = false }
+        isSpeaking = false
         localSpeech?.stop(); localSpeech = nil
         networkTask?.cancel(); networkTask = nil
         if isBusy, let last = messages.last, last.role == "user" {
