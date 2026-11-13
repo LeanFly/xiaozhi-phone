@@ -158,7 +158,7 @@ public final class LocalSpeechEngine {
             utteranceSamples += samples.count
             let energy = sqrt(samples.reduce(0) { $0 + $1 * $1 } / Float(max(1, samples.count)))
             silenceSamples = energy < 0.012 ? silenceSamples + samples.count : 0
-            let reachedSilence = utteranceSamples > Self.sampleRate / 2 && silenceSamples >= Self.sampleRate * 8 / 10
+            let reachedSilence = utteranceSamples > Self.sampleRate * 3 / 4 && silenceSamples >= Self.sampleRate * 8 / 10
             if reachedSilence || Double(utteranceSamples) / Double(Self.sampleRate) >= maxUtteranceSeconds {
                 recognizeAndFinish()
             }
@@ -180,7 +180,7 @@ public final class LocalSpeechEngine {
             SherpaOnnxDestroyOfflineRecognizerResult(result)
         }
         SherpaOnnxDestroyOfflineStream(stream)
-        guard !text.isEmpty else { return }
+        guard text.count >= 2, !text.contains("[音频"), !text.isEmpty else { return }
         let callback = completion
         DispatchQueue.main.async { callback?(text) }
     }
@@ -213,7 +213,7 @@ public final class LocalSpeechEngine {
         kwsStream = keyword?.withCString { SherpaOnnxCreateKeywordStreamWithKeywords(kws, $0) } ?? SherpaOnnxCreateKeywordStream(kws)
         st.path.withCString { t in sm.path.withCString { m in
             ac.model_config.tokens = t; ac.model_config.provider = strdup("cpu").map { UnsafePointer<CChar>($0) }; ac.model_config.num_threads = 2
-            ac.model_config.sense_voice.model = m; ac.model_config.sense_voice.language = strdup("auto").map { UnsafePointer<CChar>($0) }; ac.model_config.sense_voice.use_itn = 1
+            ac.model_config.sense_voice.model = m; ac.model_config.sense_voice.language = "zh".withCString { strdup($0) }.map { UnsafePointer<CChar>($0) }; ac.model_config.sense_voice.use_itn = 1
             asr = SherpaOnnxCreateOfflineRecognizer(&ac)
         }}
         guard asr != nil, kwsStream != nil else { throw EngineError.modelLoadFailed("sense") }
