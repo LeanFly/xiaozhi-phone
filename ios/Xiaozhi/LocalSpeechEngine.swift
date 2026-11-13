@@ -27,6 +27,9 @@ public final class LocalSpeechEngine {
     private var utterance: [Float] = []
     private var utteranceSamples = 0
     private var silenceSamples = 0
+    private var voicedSamples = 0
+    private var waitingForSpeech = false
+    public var onWake: (() -> Void)?
     private var completion: Completion?
     private let keyword: String?
     private let maxUtteranceSeconds: Double
@@ -151,16 +154,37 @@ public final class LocalSpeechEngine {
             utterance.removeAll(keepingCapacity: true)
             utteranceSamples = 0
             silenceSamples = 0
+            voicedSamples = 0
+            waitingForSpeech = true
+            let wakeCallback = onWake
+            DispatchQueue.main.async { wakeCallback?() }
             SherpaOnnxResetKeywordStream(kws, stream)
+            return // Do not submit the wake phrase itself as the user's question.
         }
         if collecting {
-            utterance.append(contentsOf: samples)
-            utteranceSamples += samples.count
             let energy = sqrt(samples.reduce(0) { $0 + $1 * $1 } / Float(max(1, samples.count)))
-            silenceSamples = energy < 0.012 ? silenceSamples + samples.count : 0
-            let reachedSilence = utteranceSamples > Self.sampleRate * 3 / 4 && silenceSamples >= Self.sampleRate * 8 / 10
+            utteranceSamples += samples.count
+            if energy >= 0.012 { voicedSamples += samples.count; silenceSamples = 0 }
+            else { silenceSamples += samples.count }
+            if waitingForSpeech {
+                // Ignore the remaining tail of the wake phrase for 250 ms, then wait
+                // for a separate question; silence alone never triggers the LLM.
+                if utteranceSamples > Self.sampleRate / 4 && energy >= 0.012 {
+                    waitingForSpeech = false
+                    utterance.removeAll(keepingCapacity: true)
+                    utteranceSamples = 0; silenceSamples = 0; voicedSamples = samples.count
+                    utterance.append(contentsOf: samples)
+                } else if utteranceSamples >= Self.sampleRate * 5 {
+                    collecting = false
+                    SherpaOnnxResetKeywordStream(kws, stream)
+                }
+                return
+            }
+            utterance.append(contentsOf: samples)
+            let reachedSilence = voicedSamples >= Self.sampleRate / 3 && silenceSamples >= Self.sampleRate * 8 / 10
             if reachedSilence || Double(utteranceSamples) / Double(Self.sampleRate) >= maxUtteranceSeconds {
-                recognizeAndFinish()
+                if voicedSamples >= Self.sampleRate / 3 { recognizeAndFinish() }
+                else { collecting = false; SherpaOnnxResetKeywordStream(kws, stream) }
             }
         }
     }
