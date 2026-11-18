@@ -221,14 +221,16 @@ public final class LocalSpeechEngine {
             }
             // A conservative adaptive floor, with hysteresis and consecutive frames,
             // avoids treating a single transient or steady fan noise as speech.
-            let threshold = max(Float(0.012), noiseRMS * 2.5)
+            // After an explicit wake, favor sensitivity; follow-up remains conservative
+            // because it can be triggered by ambient audio without a wake word.
+            let threshold = max(followUp ? Float(0.012) : Float(0.008), noiseRMS * (followUp ? 2.5 : 1.7))
             if energy >= threshold {
                 candidate.append(contentsOf: frame); candidateFrames += 1
                 candidateMin = min(candidateMin, energy); candidateMax = max(candidateMax, energy)
-                if candidateFrames >= 10 {
+                if candidateFrames >= (followUp ? 10 : 5) {
                     // Speech normally changes amplitude; stationary tones/noise should
                     // not open the gate merely by persisting above the floor.
-                    if candidateMax >= candidateMin * 1.35 {
+                    if !followUp || candidateMax >= candidateMin * 1.35 {
                         waitingForSpeech = false
                         utterance = candidate
                         utteranceSamples = candidate.count; voicedSamples = candidate.count; silenceSamples = 0
