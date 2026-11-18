@@ -34,7 +34,7 @@ public final class LocalSpeechEngine {
     private let beginWithFollowUp: Bool
     private var followUp = false
     private var speechWaitLimit = 5
-    private var ignoreSamples = Self.sampleRate / 4
+    private var ignoreSamples = 16_000 / 4
     private var completion: Completion?
     private let keyword: String?
     private let maxUtteranceSeconds: Double
