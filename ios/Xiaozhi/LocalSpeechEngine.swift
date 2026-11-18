@@ -29,6 +29,16 @@ public final class LocalSpeechEngine {
     private var silenceSamples = 0
     private var voicedSamples = 0
     private var waitingForSpeech = false
+    // All gate state is confined to workQueue. The deadline is measured in captured
+    // samples and is deliberately not renewed by rejected/noisy utterances.
+    private var waitBudgetSamples = 0
+    private var framePending: [Float] = []
+    private var candidate: [Float] = []
+    private var candidateFrames = 0
+    private var noiseRMS: Float = 0.004
+    private var candidateMin: Float = .greatestFiniteMagnitude
+    private var candidateMax: Float = 0
+    private static let frameSamples = 320 // 20 ms at 16 kHz
     public var onWake: (() -> Void)?
     public var onFollowUpTimeout: (() -> Void)?
     private let beginWithFollowUp: Bool
@@ -122,6 +132,7 @@ public final class LocalSpeechEngine {
         kwsStream = nil; kws = nil; asr = nil
         converter = nil; inputFormat = nil; utterance.removeAll(keepingCapacity: false)
         utteranceSamples = 0; silenceSamples = 0; collecting = false; running = false
+        framePending.removeAll(); candidate.removeAll(); waitBudgetSamples = 0
         completion = nil
         stopping = false
     }
@@ -144,14 +155,29 @@ public final class LocalSpeechEngine {
         }
     }
 
-    private func beginCollection(followUp: Bool) {
+    private func beginCollection(followUp: Bool, preserveBudget: Bool = false) {
         collecting = true
         self.followUp = followUp
         speechWaitLimit = followUp ? 8 : 5
-        ignoreSamples = followUp ? 0 : Self.sampleRate / 4
+        if !preserveBudget { waitBudgetSamples = Self.sampleRate * speechWaitLimit }
+        ignoreSamples = preserveBudget || followUp ? 0 : Self.sampleRate / 4
         utterance.removeAll(keepingCapacity: true)
         utteranceSamples = 0; silenceSamples = 0; voicedSamples = 0
+        candidate.removeAll(keepingCapacity: true); candidateFrames = 0
+        candidateMin = .greatestFiniteMagnitude; candidateMax = 0
+        if !preserveBudget { framePending.removeAll(keepingCapacity: true); noiseRMS = 0.004 }
         waitingForSpeech = true
+    }
+
+    private func collectionTimedOut() {
+        collecting = false
+        utterance.removeAll(keepingCapacity: true); candidate.removeAll(keepingCapacity: true)
+        if let kws, let stream = kwsStream { SherpaOnnxResetKeywordStream(kws, stream) }
+        if followUp {
+            followUp = false
+            let callback = onFollowUpTimeout
+            DispatchQueue.main.async { callback?() }
+        }
     }
 
     private func process(_ samples: [Float]) {
@@ -173,37 +199,66 @@ public final class LocalSpeechEngine {
             SherpaOnnxResetKeywordStream(kws, stream)
             return // Do not submit the wake phrase itself as the user's question.
         }
-        if collecting {
-            let energy = sqrt(samples.reduce(0) { $0 + $1 * $1 } / Float(max(1, samples.count)))
-            utteranceSamples += samples.count
-            if energy >= 0.012 { voicedSamples += samples.count; silenceSamples = 0 }
-            else { silenceSamples += samples.count }
-            if waitingForSpeech {
-                // Ignore the remaining tail of the wake phrase for 250 ms, then wait
-                // for a separate question; silence alone never triggers the LLM.
-                if utteranceSamples > ignoreSamples && energy >= 0.012 {
-                    waitingForSpeech = false
-                    utterance.removeAll(keepingCapacity: true)
-                    utteranceSamples = 0; silenceSamples = 0; voicedSamples = samples.count
-                    utterance.append(contentsOf: samples)
-                } else if utteranceSamples >= Self.sampleRate * speechWaitLimit {
-                    collecting = false
-                    SherpaOnnxResetKeywordStream(kws, stream)
-                    if followUp {
-                        followUp = false
-                        let callback = onFollowUpTimeout
-                        DispatchQueue.main.async { callback?() }
-                    }
-                }
+        framePending.append(contentsOf: samples)
+        var offset = 0
+        while collecting && framePending.count - offset >= Self.frameSamples {
+            let frame = Array(framePending[offset..<(offset + Self.frameSamples)])
+            offset += Self.frameSamples
+            processFrame(frame)
+        }
+        if offset > 0 { framePending.removeFirst(offset) }
+    }
+
+    private func processFrame(_ frame: [Float]) {
+        let energy = sqrt(frame.reduce(Float(0)) { $0 + $1 * $1 } / Float(frame.count))
+        guard energy.isFinite else { collectionTimedOut(); return }
+        waitBudgetSamples -= frame.count
+        if waitingForSpeech {
+            if waitBudgetSamples <= 0 { collectionTimedOut(); return }
+            if ignoreSamples > 0 {
+                ignoreSamples -= frame.count
                 return
             }
-            utterance.append(contentsOf: samples)
-            let reachedSilence = voicedSamples >= Self.sampleRate / 3 && silenceSamples >= Self.sampleRate * 8 / 10
-            if reachedSilence || Double(utteranceSamples) / Double(Self.sampleRate) >= maxUtteranceSeconds {
-                if voicedSamples >= Self.sampleRate / 3 { recognizeAndFinish() }
-                else if followUp { beginCollection(followUp: true) }
-                else { collecting = false; SherpaOnnxResetKeywordStream(kws, stream) }
+            // A conservative adaptive floor, with hysteresis and consecutive frames,
+            // avoids treating a single transient or steady fan noise as speech.
+            let threshold = max(Float(0.012), noiseRMS * 2.5)
+            if energy >= threshold {
+                candidate.append(contentsOf: frame); candidateFrames += 1
+                candidateMin = min(candidateMin, energy); candidateMax = max(candidateMax, energy)
+                if candidateFrames >= 10 {
+                    // Speech normally changes amplitude; stationary tones/noise should
+                    // not open the gate merely by persisting above the floor.
+                    if candidateMax >= candidateMin * 1.35 {
+                        waitingForSpeech = false
+                        utterance = candidate
+                        utteranceSamples = candidate.count; voicedSamples = candidate.count; silenceSamples = 0
+                        candidate.removeAll(keepingCapacity: true); candidateFrames = 0
+                    } else {
+                        // Learn sustained stationary noise, then require a new onset.
+                        noiseRMS = min(0.08, max(noiseRMS, energy))
+                        candidate.removeAll(keepingCapacity: true); candidateFrames = 0
+                        candidateMin = .greatestFiniteMagnitude; candidateMax = 0
+                    }
+                }
+            } else {
+                candidate.removeAll(keepingCapacity: true); candidateFrames = 0
+                candidateMin = .greatestFiniteMagnitude; candidateMax = 0
+                noiseRMS = min(0.08, max(0.001, noiseRMS * 0.98 + energy * 0.02))
             }
+            return
+        }
+        utterance.append(contentsOf: frame); utteranceSamples += frame.count
+        if energy >= max(Float(0.009), noiseRMS * 1.6) {
+            voicedSamples += frame.count; silenceSamples = 0
+        } else { silenceSamples += frame.count }
+        let reachedSilence = silenceSamples >= Self.sampleRate * 8 / 10
+        let reachedMaximum = Double(utteranceSamples) / Double(Self.sampleRate) >= maxUtteranceSeconds
+        if reachedSilence || reachedMaximum {
+            // Do not decode an uninterrupted maximum-length signal: it is often
+            // environmental noise, and decoding it can produce hallucinated text.
+            if reachedSilence && voicedSamples >= Self.sampleRate / 3 { recognizeAndFinish() }
+            else if waitBudgetSamples > 0 { beginCollection(followUp: followUp, preserveBudget: true) }
+            else { collectionTimedOut() }
         }
     }
 
@@ -211,7 +266,11 @@ public final class LocalSpeechEngine {
         guard let asr, !utterance.isEmpty else { collecting = false; return }
         let audio = utterance
         collecting = false; utterance.removeAll(keepingCapacity: true); utteranceSamples = 0; silenceSamples = 0
-        guard let stream = SherpaOnnxCreateOfflineStream(asr) else { return }
+        guard let stream = SherpaOnnxCreateOfflineStream(asr) else {
+            if waitBudgetSamples > 0 { beginCollection(followUp: followUp, preserveBudget: true) }
+            else { collectionTimedOut() }
+            return
+        }
         audio.withUnsafeBufferPointer {
             SherpaOnnxAcceptWaveformOffline(stream, Int32(Self.sampleRate), $0.baseAddress, Int32($0.count))
         }
@@ -223,7 +282,8 @@ public final class LocalSpeechEngine {
         }
         SherpaOnnxDestroyOfflineStream(stream)
         guard text.count >= 2, !text.contains("[音频"), !text.isEmpty else {
-            if followUp { beginCollection(followUp: true) }
+            if waitBudgetSamples > 0 { beginCollection(followUp: followUp, preserveBudget: true) }
+            else { collectionTimedOut() }
             return
         }
         let callback = completion
