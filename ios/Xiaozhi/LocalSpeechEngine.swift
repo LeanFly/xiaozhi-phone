@@ -173,11 +173,9 @@ public final class LocalSpeechEngine {
         collecting = false
         utterance.removeAll(keepingCapacity: true); candidate.removeAll(keepingCapacity: true)
         if let kws, let stream = kwsStream { SherpaOnnxResetKeywordStream(kws, stream) }
-        if followUp {
-            followUp = false
-            let callback = onFollowUpTimeout
-            DispatchQueue.main.async { callback?() }
-        }
+        followUp = false
+        let callback = onFollowUpTimeout
+        DispatchQueue.main.async { callback?() }
     }
 
     private func process(_ samples: [Float]) {
