@@ -7,7 +7,8 @@ struct ContentView: View {
     @State private var displayPolicy = DisplayPolicy()
     @State private var speakingUntil = Date.distantPast
     @State private var holding = false
-    @FocusState private var editing: Bool
+    @State private var showConversation = false
+    @State private var hideTask: Task<Void, Never>?
 
     private var waiting: Bool { assistant.isBusy && (assistant.status.hasPrefix("正在请求回答") || assistant.status.hasPrefix("正在通过 HTTP")) }
     private var statusColor: Color {
@@ -50,7 +51,7 @@ struct ContentView: View {
                     Spacer(minLength: 0)
                     Text(holding ? "继续按住 5 秒进入设置" : "长按吉祥物 5 秒进入设置")
                         .font(.caption).foregroundStyle(.white.opacity(0.65))
-                    if !assistant.messages.isEmpty {
+                    if showConversation && !assistant.messages.isEmpty {
                         ScrollViewReader { proxy in
                             ScrollView {
                                 LazyVStack(alignment: .leading, spacing: 12) {
@@ -60,15 +61,13 @@ struct ContentView: View {
                                     }
                                 }.padding(14)
                             }
-                            .frame(maxHeight: min(180, geometry.size.height * 0.23))
+                            .frame(maxWidth: geometry.size.width > geometry.size.height ? geometry.size.width * 0.42 : .infinity,
+                                   maxHeight: min(180, geometry.size.height * 0.30))
                             .background(.black.opacity(0.62), in: RoundedRectangle(cornerRadius: 16))
                             .onChange(of: assistant.messages.count) { _, _ in
                                 if let id = assistant.messages.last?.id { withAnimation { proxy.scrollTo(id, anchor: .bottom) } }
                             }
                         }
-                    }
-                    if !assistant.messages.isEmpty {
-                        Color.clear.frame(height: 1)
                     }
                 }.padding(.horizontal, 20).padding(.top, 12).padding(.bottom, 28)
             }
@@ -76,17 +75,35 @@ struct ContentView: View {
         .preferredColorScheme(.dark)
         .statusBarHidden(true)
         .onAppear { displayPolicy.activate(); assistant.startAutoListening() }
-        .onDisappear { displayPolicy.deactivate() }
-        .sheet(isPresented: $showingSettings) { SettingsView(assistant: assistant) }
+        .onDisappear { hideTask?.cancel(); displayPolicy.deactivate() }
+        .sheet(isPresented: $showingSettings, onDismiss: {
+            if scenePhase == .active { assistant.startAutoListening() }
+        }) { SettingsView(assistant: assistant) }
         .onChange(of: assistant.messages.count) { _, _ in
-            if let message = assistant.messages.last, message.role == "assistant" {
-                // AssistantModel does not expose TTS callbacks; estimate the animation duration.
-                speakingUntil = Date().addingTimeInterval(min(120, max(2, Double(message.content.count) / 4)))
-            }
+            guard !assistant.messages.isEmpty else { return }
+            showConversation = true
+            scheduleHideConversation()
+        }
+        .onChange(of: assistant.isBusy) { _, busy in
+            if !busy && showConversation { scheduleHideConversation() }
+        }
+        .onChange(of: assistant.isSpeaking) { _, speaking in
+            if speaking { hideTask?.cancel(); showConversation = true }
+            else if showConversation { scheduleHideConversation() }
         }
         .onChange(of: scenePhase) { _, phase in
             if phase != .active { displayPolicy.deactivate(); speakingUntil = .distantPast; assistant.stopAll() }
             else { displayPolicy.activate(); if !showingSettings { assistant.startAutoListening() } }
+        }
+    }
+
+    private func scheduleHideConversation() {
+        hideTask?.cancel()
+        guard !assistant.isSpeaking, !assistant.isBusy else { return }
+        hideTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(15))
+            guard !Task.isCancelled, !assistant.isSpeaking, !assistant.isBusy else { return }
+            withAnimation { showConversation = false }
         }
     }
 }

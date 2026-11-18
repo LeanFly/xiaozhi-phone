@@ -30,6 +30,11 @@ public final class LocalSpeechEngine {
     private var voicedSamples = 0
     private var waitingForSpeech = false
     public var onWake: (() -> Void)?
+    public var onFollowUpTimeout: (() -> Void)?
+    private let beginWithFollowUp: Bool
+    private var followUp = false
+    private var speechWaitLimit = 5
+    private var ignoreSamples = Self.sampleRate / 4
     private var completion: Completion?
     private let keyword: String?
     private let maxUtteranceSeconds: Double
@@ -39,7 +44,8 @@ public final class LocalSpeechEngine {
     private static let tapBufferFrames: AVAudioFrameCount = 2_048
 
     /// `keyword` is optional when the kws model's keywords.txt already defines it.
-    public init(keyword: String? = nil, maxUtteranceSeconds: Double = 8.0) {
+    public init(keyword: String? = nil, maxUtteranceSeconds: Double = 8.0, beginWithFollowUp: Bool = false) {
+        self.beginWithFollowUp = beginWithFollowUp
         self.keyword = keyword
         self.maxUtteranceSeconds = max(1.0, maxUtteranceSeconds)
         workQueue.setSpecific(key: queueKey, value: ())
@@ -82,6 +88,7 @@ public final class LocalSpeechEngine {
                         try self.audioEngine.start()
                         self.running = true
                         self.stopping = false
+                        if self.beginWithFollowUp { self.beginCollection(followUp: true) }
                         continuation.resume()
                     } catch {
                         self.stopLocked()
@@ -137,6 +144,16 @@ public final class LocalSpeechEngine {
         }
     }
 
+    private func beginCollection(followUp: Bool) {
+        collecting = true
+        self.followUp = followUp
+        speechWaitLimit = followUp ? 8 : 5
+        ignoreSamples = followUp ? 0 : Self.sampleRate / 4
+        utterance.removeAll(keepingCapacity: true)
+        utteranceSamples = 0; silenceSamples = 0; voicedSamples = 0
+        waitingForSpeech = true
+    }
+
     private func process(_ samples: [Float]) {
         guard let kws, let stream = kwsStream else { return }
         samples.withUnsafeBufferPointer {
@@ -150,12 +167,7 @@ public final class LocalSpeechEngine {
             let hit = result.pointee.keyword.map { String(cString: $0) } ?? ""
             SherpaOnnxDestroyKeywordResult(result)
             guard !hit.isEmpty else { return }
-            collecting = true
-            utterance.removeAll(keepingCapacity: true)
-            utteranceSamples = 0
-            silenceSamples = 0
-            voicedSamples = 0
-            waitingForSpeech = true
+            beginCollection(followUp: false)
             let wakeCallback = onWake
             DispatchQueue.main.async { wakeCallback?() }
             SherpaOnnxResetKeywordStream(kws, stream)
@@ -169,14 +181,19 @@ public final class LocalSpeechEngine {
             if waitingForSpeech {
                 // Ignore the remaining tail of the wake phrase for 250 ms, then wait
                 // for a separate question; silence alone never triggers the LLM.
-                if utteranceSamples > Self.sampleRate / 4 && energy >= 0.012 {
+                if utteranceSamples > ignoreSamples && energy >= 0.012 {
                     waitingForSpeech = false
                     utterance.removeAll(keepingCapacity: true)
                     utteranceSamples = 0; silenceSamples = 0; voicedSamples = samples.count
                     utterance.append(contentsOf: samples)
-                } else if utteranceSamples >= Self.sampleRate * 5 {
+                } else if utteranceSamples >= Self.sampleRate * speechWaitLimit {
                     collecting = false
                     SherpaOnnxResetKeywordStream(kws, stream)
+                    if followUp {
+                        followUp = false
+                        let callback = onFollowUpTimeout
+                        DispatchQueue.main.async { callback?() }
+                    }
                 }
                 return
             }
@@ -184,6 +201,7 @@ public final class LocalSpeechEngine {
             let reachedSilence = voicedSamples >= Self.sampleRate / 3 && silenceSamples >= Self.sampleRate * 8 / 10
             if reachedSilence || Double(utteranceSamples) / Double(Self.sampleRate) >= maxUtteranceSeconds {
                 if voicedSamples >= Self.sampleRate / 3 { recognizeAndFinish() }
+                else if followUp { beginCollection(followUp: true) }
                 else { collecting = false; SherpaOnnxResetKeywordStream(kws, stream) }
             }
         }
@@ -204,7 +222,10 @@ public final class LocalSpeechEngine {
             SherpaOnnxDestroyOfflineRecognizerResult(result)
         }
         SherpaOnnxDestroyOfflineStream(stream)
-        guard text.count >= 2, !text.contains("[音频"), !text.isEmpty else { return }
+        guard text.count >= 2, !text.contains("[音频"), !text.isEmpty else {
+            if followUp { beginCollection(followUp: true) }
+            return
+        }
         let callback = completion
         DispatchQueue.main.async { callback?(text) }
     }

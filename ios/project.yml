@@ -32,6 +32,10 @@ targets:
       properties:
         NSMicrophoneUsageDescription: "使用麦克风进行本地语音对话。"
         NSLocalNetworkUsageDescription: "连接局域网内用户配置的模型服务。"
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
     settings:
@@ -43,7 +47,6 @@ targets:
         INFOPLIST_KEY_NSMicrophoneUsageDescription: "使用麦克风进行语音对话。"
         INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: "使用语音识别将语音转换为文本。"
         TARGETED_DEVICE_FAMILY: "1"
-        UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait"
         ARCHS: arm64
         CODE_SIGNING_ALLOWED: NO
         CODE_SIGNING_REQUIRED: NO

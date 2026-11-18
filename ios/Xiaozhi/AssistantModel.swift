@@ -62,6 +62,7 @@ final class AssistantModel: ObservableObject {
     @Published var isBusy = false
     @Published var isSpeaking = false
     private var shouldResumeListening = false
+    private var speechDelegate: SpeechDelegate?
 
     private var localSpeech: LocalSpeechEngine?
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN"))
@@ -74,7 +75,8 @@ final class AssistantModel: ObservableObject {
     private var tapInstalled = false
 
     func saveSettings() {
-        let wasAutoListening = isListening || shouldResumeListening
+        // The settings screen stops listening before invoking this method.
+        let wasAutoListening = true
         stopAll()
         do {
             try KeyStore.save(apiKey)
@@ -89,8 +91,10 @@ final class AssistantModel: ObservableObject {
         if wasAutoListening { startAutoListening() }
     }
 
-    func startAutoListening() {
-        guard !isListening && !isBusy else { return }
+    func startAutoListening() { startAutoListening(followUp: false) }
+
+    private func startAutoListening(followUp: Bool) {
+        guard !isListening && !isBusy && !isSpeaking else { return }
         let token = UUID(); generation = token
         isBusy = true
         status = "正在请求麦克风权限…"
@@ -101,7 +105,13 @@ final class AssistantModel: ObservableObject {
             do {
                 try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth])
                 try AVAudioSession.sharedInstance().setActive(true)
-                let local = LocalSpeechEngine()
+                let local = LocalSpeechEngine(beginWithFollowUp: followUp)
+                local.onFollowUpTimeout = { [weak self] in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.generation == token, self.isListening else { return }
+                        self.status = "正在监听：小智同学"
+                    }
+                }
                 local.onWake = { [weak self] in
                     Task { @MainActor [weak self] in
                         guard let self, self.generation == token else { return }
@@ -121,8 +131,12 @@ final class AssistantModel: ObservableObject {
                 }
                 guard generation == token else { local.stop(); return }
                 localSpeech = local
-                isBusy = false; isListening = true; status = "正在监听：小智同学"; shouldResumeListening = true
+                isBusy = false; isListening = true
+                status = followUp ? "请继续说，约8秒无语音后返回唤醒监听" : "正在监听：小智同学"
+                shouldResumeListening = true
             } catch {
+                guard generation == token else { return }
+                localSpeech = nil
                 isBusy = false; isListening = false
                 status = "本地语音启动失败：\(error.localizedDescription)"
             }
@@ -218,7 +232,9 @@ final class AssistantModel: ObservableObject {
         let text = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { status = "请输入或识别问题。"; return }
         guard let url = endpoint(), !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            status = "请填写有效的 HTTPS 地址或局域网 HTTP 地址及模型；HTTP 明文传输有泄露风险。"; return
+            status = "请填写有效的 HTTPS 地址或局域网 HTTP 地址及模型；HTTP 明文传输有泄露风险。"
+            if shouldResumeListening { startAutoListening() }
+            return
         }
         let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let userMessage = ChatMessage(role: "user", content: text)
@@ -255,12 +271,22 @@ final class AssistantModel: ObservableObject {
                 let utterance = AVSpeechUtterance(string: Self.speechText(answer))
                 utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
                 isSpeaking = true
-                synthesizer.speak(utterance)
-                while synthesizer.isSpeaking && generation == token {
-                    try await Task.sleep(nanoseconds: 150_000_000)
+                let delegate = SpeechDelegate { [weak self] finished in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.generation == token else { return }
+                        self.isSpeaking = false
+                        self.speechDelegate = nil
+                        if finished && self.shouldResumeListening {
+                            // Let speaker output drain before reopening the microphone.
+                            try? await Task.sleep(nanoseconds: 400_000_000)
+                            guard self.generation == token, self.shouldResumeListening else { return }
+                            self.startAutoListening(followUp: true)
+                        }
+                    }
                 }
-                isSpeaking = false
-                if generation == token && shouldResumeListening { startAutoListening() }
+                speechDelegate = delegate
+                synthesizer.delegate = delegate
+                synthesizer.speak(utterance)
             } catch {
                 guard generation == token else { return }
                 isBusy = false
@@ -275,7 +301,7 @@ final class AssistantModel: ObservableObject {
 
     func stopAll() {
         generation = UUID()
-        if !isListening && !isBusy { shouldResumeListening = false }
+        shouldResumeListening = false
         isSpeaking = false
         localSpeech?.stop(); localSpeech = nil
         networkTask?.cancel(); networkTask = nil
@@ -285,6 +311,7 @@ final class AssistantModel: ObservableObject {
         }
         stopCapture(cancel: true)
         synthesizer.stopSpeaking(at: .immediate)
+        synthesizer.delegate = nil; speechDelegate = nil
         isBusy = false
         status = "已停止。"
     }
@@ -333,6 +360,17 @@ final class AssistantModel: ObservableObject {
             text = text.replacingOccurrences(of: pattern, with: replacement, options: .regularExpression)
         }
         return text
+    }
+
+    private final class SpeechDelegate: NSObject, AVSpeechSynthesizerDelegate {
+        private let completion: (Bool) -> Void
+        init(completion: @escaping (Bool) -> Void) { self.completion = completion }
+        func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+            completion(true)
+        }
+        func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+            completion(false)
+        }
     }
 
     private final class NoRedirectDelegate: NSObject, URLSessionTaskDelegate {
